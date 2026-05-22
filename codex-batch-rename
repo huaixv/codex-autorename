@@ -1,0 +1,325 @@
+#!/usr/bin/env node
+
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+
+const DEFAULT_REAL_CODEX = "/usr/bin/codex";
+const CODEX_HOME = process.env.CODEX_HOME || join(process.env.HOME || "", ".codex");
+const HISTORY_PATH = join(CODEX_HOME, "history.jsonl");
+const SESSION_INDEX_PATH = join(CODEX_HOME, "session_index.jsonl");
+const ASSIST_MODEL = "gpt-5.4-mini";
+const TITLE_MAX_CHARS = 36;
+const PROMPT_MAX_CHARS = 2000;
+const ASSIST_PROMPT_PREFIX =
+  "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.";
+
+const args = process.argv.slice(2);
+const dryRun = args.includes("--dry-run");
+const selfTest = args.includes("--self-test");
+const limit = parsePositiveInteger(readFlagValue(args, "--limit") || readFlagValue(args, "--batch-limit"));
+const realCodex = readFlagValue(args, "--real-codex") || DEFAULT_REAL_CODEX;
+
+if (selfTest) {
+  runSelfTest();
+} else {
+  runBatchRename({ dryRun, limit });
+}
+
+function runBatchRename(options = {}) {
+  const candidates = readUnnamedTranscripts();
+  const selected =
+    options.limit && candidates.length > options.limit ? candidates.slice(0, options.limit) : candidates;
+
+  if (options.dryRun) {
+    console.log(
+      JSON.stringify(
+        {
+          total: candidates.length,
+          selected: selected.length,
+          sessions: selected,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  let renamed = 0;
+  let skipped = 0;
+  for (const transcript of selected) {
+    const title = generateTitle(transcript.prompt);
+    if (!title) {
+      skipped += 1;
+      process.stderr.write(`[batch-rename] skipped ${transcript.sessionId}\n`);
+      continue;
+    }
+    appendThreadNameToSessionIndex(transcript.sessionId, title);
+    renamed += 1;
+    process.stderr.write(`[batch-rename] ${transcript.sessionId} -> ${title}\n`);
+  }
+
+  process.stderr.write(
+    `[batch-rename] done: renamed ${renamed}, skipped ${skipped}, candidates ${candidates.length}\n`,
+  );
+}
+
+function readUnnamedTranscripts() {
+  if (!existsSync(HISTORY_PATH)) {
+    return [];
+  }
+  return collectUnnamedTranscripts(readJsonLines(HISTORY_PATH), readSessionNames());
+}
+
+function readSessionNames() {
+  if (!existsSync(SESSION_INDEX_PATH)) {
+    return new Map();
+  }
+  return collectSessionNames(readJsonLines(SESSION_INDEX_PATH));
+}
+
+function collectSessionNames(entries) {
+  const names = new Map();
+  for (const entry of entries) {
+    if (typeof entry?.id !== "string") {
+      continue;
+    }
+    if (typeof entry.thread_name === "string" && entry.thread_name.trim()) {
+      names.set(entry.id, entry.thread_name.trim());
+    } else {
+      names.set(entry.id, null);
+    }
+  }
+  return names;
+}
+
+function collectUnnamedTranscripts(historyEntries, sessionNames) {
+  const firstPrompts = new Map();
+  for (const entry of historyEntries) {
+    if (typeof entry?.session_id !== "string" || typeof entry.text !== "string") {
+      continue;
+    }
+    const prompt = entry.text.trim();
+    if (!prompt || isHelperPrompt(prompt) || firstPrompts.has(entry.session_id)) {
+      continue;
+    }
+    firstPrompts.set(entry.session_id, prompt);
+  }
+
+  const transcripts = [];
+  for (const [sessionId, prompt] of firstPrompts) {
+    if (sessionNames.get(sessionId)) {
+      continue;
+    }
+    transcripts.push({ sessionId, prompt });
+  }
+  return transcripts;
+}
+
+function generateTitle(prompt) {
+  const outputDir = mkdtempSync(join(tmpdir(), "codex-batch-rename-"));
+  const outputPath = join(outputDir, "title.txt");
+  try {
+    const result = spawnSync(
+      realCodexBin(),
+      [
+        "exec",
+        "-m",
+        ASSIST_MODEL,
+        "-c",
+        "features.codex_hooks=false",
+        "-o",
+        outputPath,
+        "-",
+      ],
+      {
+        input: buildAssistPrompt(prompt),
+        cwd: process.cwd(),
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    if (result.status !== 0 || !existsSync(outputPath)) {
+      return null;
+    }
+    return sanitizeTitle(readFileSync(outputPath, "utf8"));
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
+}
+
+function appendThreadNameToSessionIndex(sessionId, title) {
+  appendFileSync(
+    SESSION_INDEX_PATH,
+    `${JSON.stringify({
+      id: sessionId,
+      thread_name: title,
+      updated_at: new Date().toISOString(),
+    })}\n`,
+    "utf8",
+  );
+}
+
+function buildAssistPrompt(prompt) {
+  const clippedPrompt = prompt.slice(0, PROMPT_MAX_CHARS);
+  return `${ASSIST_PROMPT_PREFIX}
+The tasks typically have to do with coding-related tasks, for example requests for bug fixes or questions about a codebase. The title you generate will be shown in the UI to represent the prompt.
+Generate a concise UI title (up to 36 characters) for this task.
+Fill the structured title field with plain text.
+Do not include quotes, markdown, formatting characters, or trailing punctuation in the title value.
+If the task includes a ticket reference (e.g. ABC-123), include it verbatim.
+
+Generate a clear, informative task title based solely on the prompt provided. Follow the rules below to ensure consistency, readability, and usefulness.
+
+How to write a good title:
+Generate a single-line title that captures the question or core change requested. The title should be easy to scan and useful in changelogs or review queues.
+- Use an imperative verb first: "Add", "Fix", "Update", "Refactor", "Remove", "Locate", "Find", etc.
+- Keep it under 36 characters and under 5 words where possible.
+- If the user's prompt is already a short clear title, reuse it verbatim.
+- Capitalize only the first word (unless locale requires otherwise).
+- Write the title in the user's locale.
+- Do not use punctuation at the end.
+- Output the title as plain text with no surrounding quotes or backticks.
+- Use precise, non-redundant language.
+- Translate fixed phrases into the user's locale (e.g., "Fix bug" -> "Corrige el error" in Spanish-ES), but leave code terms in English unless a widely adopted translation exists.
+- If the user provides a title explicitly, reuse it (translated if needed) and skip generation logic.
+- Make it clear when the user is requesting changes (use verbs like "Fix", "Add", etc) vs asking a question (use verbs like "Find", "Locate", "Count").
+- Do NOT respond to the user, answer questions, or attempt to solve the problem; just write a title that can represent the user's query.
+
+Examples:
+- User: "Can we add dark-mode support to the settings page?" -> Add dark-mode support
+- User: "Fehlerbehebung: Beim Anmelden erscheint 500." (de-DE) -> Login-Fehler 500 beheben
+- User: "Refactoriser le composant sidebar pour réduire le code dupliqué." (fr-FR) -> Refactoriser composant sidebar
+- User: "How do I fix our login bug?" -> Troubleshoot login bug
+- User: "Where in the codebase is foo_bar created" -> Locate foo_bar
+- User: "what's 2+2" -> Calculate 2+2
+
+By following these conventions, your titles will be readable, changelog-friendly, and helpful to both users and downstream tools.
+
+User prompt:
+${clippedPrompt}`;
+}
+
+function isHelperPrompt(prompt) {
+  return prompt.trimStart().startsWith(ASSIST_PROMPT_PREFIX);
+}
+
+function sanitizeTitle(output) {
+  let title = (output.replace(/\r\n/g, "\n").split("\n").find((part) => part.trim().length > 0) ?? "")
+    .trim();
+  if (
+    title.length === 0 ||
+    ((title = title.replace(/^title[:\s]+/i, "")),
+    (title = title.replace(/^[`"'“”‘’]+|[`"'“”‘’]+$/g, "")),
+    (title = title.replace(/\s+/g, " ").trim()),
+    (title = title.replace(/[.?!]+$/, "").trim()),
+    title.length === 0)
+  ) {
+    return null;
+  }
+
+  if (title.length > TITLE_MAX_CHARS) {
+    title = `${title.slice(0, TITLE_MAX_CHARS - 1).trimEnd()}…`;
+  }
+  return title;
+}
+
+function readJsonLines(path) {
+  try {
+    return jsonLines(readFileSync(path, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+function jsonLines(raw) {
+  return raw
+    .split("\n")
+    .map((line) => {
+      if (!line.trim()) {
+        return null;
+      }
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function readFlagValue(args, name) {
+  const prefix = `${name}=`;
+  for (const arg of args) {
+    if (arg.startsWith(prefix)) {
+      return arg.slice(prefix.length);
+    }
+  }
+  return null;
+}
+
+function parsePositiveInteger(value) {
+  if (value === null) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return null;
+  }
+  return parsed;
+}
+
+function realCodexBin() {
+  return process.env.CODEX_REAL_BIN || realCodex;
+}
+
+function runSelfTest() {
+  const cases = [
+    ['"Port Codex auto title."\n', "Port Codex auto title"],
+    ["title: Add dark-mode support", "Add dark-mode support"],
+    ["\r\n  title: Fix login bug?!  \nignored", "Fix login bug"],
+    ["A very long title that should be clipped at thirty six chars", "A very long title that should be cl…"],
+  ];
+
+  for (const [input, expected] of cases) {
+    const actual = sanitizeTitle(input);
+    if (actual !== expected) {
+      console.error(`sanitizeTitle failed: expected ${expected}, got ${actual}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  const unnamed = collectUnnamedTranscripts(
+    [
+      { session_id: "named", text: "already named", ts: 1 },
+      { session_id: "unnamed", text: "first prompt", ts: 2 },
+      { session_id: "unnamed", text: "later prompt", ts: 3 },
+      { session_id: "helper", text: buildAssistPrompt("skip helper"), ts: 4 },
+      { session_id: "cleared", text: "rename cleared", ts: 5 },
+    ],
+    new Map([
+      ["named", "Existing title"],
+      ["cleared", null],
+    ]),
+  );
+  const expectedUnnamed = [
+    { sessionId: "unnamed", prompt: "first prompt" },
+    { sessionId: "cleared", prompt: "rename cleared" },
+  ];
+  if (JSON.stringify(unnamed) !== JSON.stringify(expectedUnnamed)) {
+    console.error(`collectUnnamedTranscripts failed: ${JSON.stringify(unnamed)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log("self-test passed");
+}
