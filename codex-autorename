@@ -1,0 +1,532 @@
+#!/usr/bin/env node
+
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import net from "node:net";
+
+const DEFAULT_REAL_CODEX = "/usr/bin/codex";
+const ASSIST_MODEL = "gpt-5.4-mini";
+const TITLE_MAX_CHARS = 36;
+const PROMPT_MAX_CHARS = 2000;
+const STARTUP_TIMEOUT_MS = 15000;
+const ASSIST_PROMPT_PREFIX =
+  "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.";
+
+const args = process.argv.slice(2);
+const realCodex = readFlagValue(args, "--real-codex") || DEFAULT_REAL_CODEX;
+const codexArgs = args.filter((arg) => !arg.startsWith("--real-codex="));
+
+const runtimeDir = mkdtempSync(join(tmpdir(), "codex-auto-title-proxy-"));
+const backendSocket = join(runtimeDir, "backend.sock");
+const proxySocket = join(runtimeDir, "proxy.sock");
+const backendEndpoint = `unix://${backendSocket}`;
+const proxyEndpoint = `unix://${proxySocket}`;
+
+let backend = null;
+let proxyServer = null;
+let tui = null;
+
+try {
+  backend = spawn(realCodex, ["app-server", "--listen", backendEndpoint], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: process.env,
+  });
+  let backendStderr = "";
+  backend.stderr.on("data", (chunk) => {
+    backendStderr += chunk.toString("utf8");
+  });
+  await waitForSocket(backendSocket, backend, () => backendStderr);
+
+  proxyServer = await startProxy(proxySocket, backendSocket);
+
+  tui = spawn(realCodex, [...codexArgsWithRemote(codexArgs, proxyEndpoint)], {
+    stdio: "inherit",
+    env: process.env,
+  });
+
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, () => {
+      tui?.kill(signal);
+      backend?.kill(signal);
+    });
+  }
+
+  const exit = await new Promise((resolve) => {
+    tui.on("exit", (code, signal) => resolve({ code, signal }));
+  });
+  if (exit.signal) {
+    process.exitCode = 128;
+  } else {
+    process.exitCode = exit.code ?? 0;
+  }
+} finally {
+  proxyServer?.close();
+  backend?.kill("SIGTERM");
+  rmSync(runtimeDir, { recursive: true, force: true });
+}
+
+async function startProxy(proxySocketPath, backendSocketPath) {
+  mkdirSync(dirname(proxySocketPath), { recursive: true });
+  const server = net.createServer((client) => {
+    const backendConn = net.createConnection(backendSocketPath);
+    const state = {
+      renamedThreads: new Set(),
+      clientBuffer: Buffer.alloc(0),
+      backendBuffer: Buffer.alloc(0),
+      clientUpgraded: false,
+      backendUpgraded: false,
+    };
+
+    client.on("data", (chunk) => {
+      state.clientBuffer = Buffer.concat([state.clientBuffer, chunk]);
+      pumpClientToBackend(state, client, backendConn, backendSocketPath);
+    });
+    backendConn.on("data", (chunk) => {
+      state.backendBuffer = Buffer.concat([state.backendBuffer, chunk]);
+      pumpBackendToClient(state, client, backendConn);
+    });
+
+    client.on("error", () => backendConn.destroy());
+    backendConn.on("error", () => client.destroy());
+    client.on("close", () => backendConn.destroy());
+    backendConn.on("close", () => client.destroy());
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(proxySocketPath, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  return server;
+}
+
+function pumpClientToBackend(state, client, backendConn, backendSocketPath) {
+  if (!state.clientUpgraded) {
+    const headerEnd = state.clientBuffer.indexOf("\r\n\r\n");
+    if (headerEnd === -1) {
+      return;
+    }
+    const headerBytes = state.clientBuffer.slice(0, headerEnd + 4);
+    state.clientBuffer = state.clientBuffer.slice(headerEnd + 4);
+    backendConn.write(headerBytes);
+    state.clientUpgraded = true;
+  }
+
+  for (;;) {
+    const frame = decodeWebSocketFrame(state.clientBuffer);
+    if (!frame) {
+      break;
+    }
+    state.clientBuffer = state.clientBuffer.slice(frame.bytes);
+    backendConn.write(encodeClientWebSocketTextFramePayload(frame.opcode, frame.payload));
+    if (frame.opcode !== 0x1) {
+      continue;
+    }
+    const message = parseJson(frame.payload.toString("utf8"));
+    const turn = firstTurnStart(message, state.renamedThreads);
+    if (turn) {
+      state.renamedThreads.add(turn.threadId);
+      setImmediate(() => renameFromInitialPrompt(backendSocketPath, turn.threadId, turn.prompt));
+    }
+  }
+}
+
+function pumpBackendToClient(state, client, backendConn) {
+  if (!state.backendUpgraded) {
+    const headerEnd = state.backendBuffer.indexOf("\r\n\r\n");
+    if (headerEnd === -1) {
+      return;
+    }
+    const headerBytes = state.backendBuffer.slice(0, headerEnd + 4);
+    state.backendBuffer = state.backendBuffer.slice(headerEnd + 4);
+    client.write(headerBytes);
+    state.backendUpgraded = true;
+  }
+
+  if (state.backendBuffer.length > 0) {
+    client.write(state.backendBuffer);
+    state.backendBuffer = Buffer.alloc(0);
+  }
+}
+
+function firstTurnStart(message, renamedThreads) {
+  if (message?.method !== "turn/start") {
+    return null;
+  }
+  const threadId = message.params?.threadId;
+  if (!threadId || renamedThreads.has(threadId)) {
+    return null;
+  }
+  const prompt = userInputText(message.params?.input);
+  if (!prompt) {
+    return null;
+  }
+  return { threadId, prompt };
+}
+
+function userInputText(input) {
+  if (!Array.isArray(input)) {
+    return null;
+  }
+  return input
+    .filter((item) => item?.type === "text" && typeof item.text === "string")
+    .map((item) => item.text.trim())
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+async function renameFromInitialPrompt(backendSocketPath, threadId, prompt) {
+  const title = await generateTitle(prompt);
+  if (!title) {
+    return;
+  }
+  try {
+    await sendRemoteJsonRpc(`unix://${backendSocketPath}`, [
+      {
+        method: "initialize",
+        id: 1,
+        params: {
+          clientInfo: {
+            name: "codex_auto_title_proxy",
+            title: "Codex Auto Title Proxy",
+            version: "0.1.0",
+          },
+          capabilities: { experimentalApi: true },
+        },
+      },
+      { method: "initialized" },
+      {
+        method: "thread/name/set",
+        id: 2,
+        params: { threadId, name: title },
+      },
+    ]);
+  } catch (err) {
+    void err;
+  }
+}
+
+async function generateTitle(prompt) {
+  const outputDir = mkdtempSync(join(tmpdir(), "codex-auto-title-proxy-title-"));
+  const outputPath = join(outputDir, "title.txt");
+  try {
+    const result = await runProcess(
+      realCodex,
+      [
+        "exec",
+        "-m",
+        ASSIST_MODEL,
+        "-c",
+        "features.codex_hooks=false",
+        "-o",
+        outputPath,
+        "-",
+      ],
+      {
+        input: buildAssistPrompt(prompt),
+        cwd: process.cwd(),
+      },
+    );
+    if (result !== 0 || !existsSync(outputPath)) {
+      return null;
+    }
+    return sanitizeTitle(readFileSync(outputPath, "utf8"));
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
+}
+
+function runProcess(command, commandArgs, options = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(command, commandArgs, {
+      cwd: options.cwd,
+      stdio: ["pipe", "ignore", "ignore"],
+      env: process.env,
+    });
+    child.on("error", () => resolve(1));
+    child.on("exit", (code) => resolve(code ?? 0));
+    child.stdin.end(options.input ?? "");
+  });
+}
+
+function buildAssistPrompt(prompt) {
+  const clippedPrompt = prompt.slice(0, PROMPT_MAX_CHARS);
+  return `${ASSIST_PROMPT_PREFIX}
+The tasks typically have to do with coding-related tasks, for example requests for bug fixes or questions about a codebase. The title you generate will be shown in the UI to represent the prompt.
+Generate a concise UI title (up to 36 characters) for this task.
+Fill the structured title field with plain text.
+Do not include quotes, markdown, formatting characters, or trailing punctuation in the title value.
+If the task includes a ticket reference (e.g. ABC-123), include it verbatim.
+
+Generate a clear, informative task title based solely on the prompt provided. Follow the rules below to ensure consistency, readability, and usefulness.
+
+How to write a good title:
+Generate a single-line title that captures the question or core change requested. The title should be easy to scan and useful in changelogs or review queues.
+- Use an imperative verb first: "Add", "Fix", "Update", "Refactor", "Remove", "Locate", "Find", etc.
+- Keep it under 36 characters and under 5 words where possible.
+- If the user's prompt is already a short clear title, reuse it verbatim.
+- Capitalize only the first word (unless locale requires otherwise).
+- Write the title in the user's locale.
+- Do not use punctuation at the end.
+- Output the title as plain text with no surrounding quotes or backticks.
+- Use precise, non-redundant language.
+- Translate fixed phrases into the user's locale (e.g., "Fix bug" -> "Corrige el error" in Spanish-ES), but leave code terms in English unless a widely adopted translation exists.
+- If the user provides a title explicitly, reuse it (translated if needed) and skip generation logic.
+- Make it clear when the user is requesting changes (use verbs like "Fix", "Add", etc) vs asking a question (use verbs like "Find", "Locate", "Count").
+- Do NOT respond to the user, answer questions, or attempt to solve the problem; just write a title that can represent the user's query.
+
+Examples:
+- User: "Can we add dark-mode support to the settings page?" -> Add dark-mode support
+- User: "Fehlerbehebung: Beim Anmelden erscheint 500." (de-DE) -> Login-Fehler 500 beheben
+- User: "Refactoriser le composant sidebar pour réduire le code dupliqué." (fr-FR) -> Refactoriser composant sidebar
+- User: "How do I fix our login bug?" -> Troubleshoot login bug
+- User: "Where in the codebase is foo_bar created" -> Locate foo_bar
+- User: "what's 2+2" -> Calculate 2+2
+
+By following these conventions, your titles will be readable, changelog-friendly, and helpful to both users and downstream tools.
+
+User prompt:
+${clippedPrompt}`;
+}
+
+function sanitizeTitle(output) {
+  let title = (output.replace(/\r\n/g, "\n").split("\n").find((part) => part.trim().length > 0) ?? "")
+    .trim();
+  if (
+    title.length === 0 ||
+    ((title = title.replace(/^title[:\s]+/i, "")),
+    (title = title.replace(/^[`"'“”‘’]+|[`"'“”‘’]+$/g, "")),
+    (title = title.replace(/\s+/g, " ").trim()),
+    (title = title.replace(/[.?!]+$/, "").trim()),
+    title.length === 0)
+  ) {
+    return null;
+  }
+  if (title.length > TITLE_MAX_CHARS) {
+    title = `${title.slice(0, TITLE_MAX_CHARS - 1).trimEnd()}…`;
+  }
+  return title;
+}
+
+function sendRemoteJsonRpc(endpoint, messages) {
+  const path = endpoint.slice("unix://".length);
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(path);
+    let buffer = Buffer.alloc(0);
+    let upgraded = false;
+    let sentAfterInitialize = false;
+    const received = [];
+    const expectedResponseId = [...messages].reverse().find((message) => message.id)?.id;
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("app-server RPC timed out"));
+    }, STARTUP_TIMEOUT_MS);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.destroy();
+    };
+    const fail = (err) => {
+      cleanup();
+      reject(err);
+    };
+
+    socket.on("connect", () => {
+      socket.write(webSocketHandshake());
+    });
+    socket.on("error", fail);
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!upgraded) {
+        const headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd === -1) {
+          return;
+        }
+        const header = buffer.slice(0, headerEnd).toString("utf8");
+        if (!header.startsWith("HTTP/1.1 101")) {
+          fail(new Error("app-server websocket upgrade failed"));
+          return;
+        }
+        upgraded = true;
+        buffer = buffer.slice(headerEnd + 4);
+        socket.write(encodeClientWebSocketTextFrame(JSON.stringify(messages[0])));
+      }
+      for (;;) {
+        const frame = decodeWebSocketFrame(buffer);
+        if (!frame) {
+          break;
+        }
+        buffer = buffer.slice(frame.bytes);
+        if (frame.opcode !== 0x1) {
+          continue;
+        }
+        const message = parseJson(frame.payload.toString("utf8"));
+        if (!message) {
+          continue;
+        }
+        received.push(message);
+        if (message.id === 1 && !sentAfterInitialize) {
+          sentAfterInitialize = true;
+          for (const nextMessage of messages.slice(1)) {
+            socket.write(encodeClientWebSocketTextFrame(JSON.stringify(nextMessage)));
+          }
+        }
+        if (message.id === expectedResponseId) {
+          cleanup();
+          resolve(received);
+          return;
+        }
+      }
+    });
+  });
+}
+
+async function waitForSocket(path, child, stderr) {
+  const started = Date.now();
+  while (Date.now() - started < STARTUP_TIMEOUT_MS) {
+    if (child.exitCode !== null) {
+      throw new Error(`managed app-server exited early: ${stderr()}`);
+    }
+    if (existsSync(path)) {
+      return;
+    }
+    await sleep(100);
+  }
+  throw new Error(`managed app-server did not create socket: ${stderr()}`);
+}
+
+function webSocketHandshake() {
+  const key = randomBytes(16).toString("base64");
+  return [
+    "GET / HTTP/1.1",
+    "Host: localhost",
+    "Upgrade: websocket",
+    "Connection: Upgrade",
+    `Sec-WebSocket-Key: ${key}`,
+    "Sec-WebSocket-Version: 13",
+    "",
+    "",
+  ].join("\r\n");
+}
+
+function encodeClientWebSocketTextFrame(text) {
+  return encodeClientWebSocketTextFramePayload(Buffer.from(text, "utf8"));
+}
+
+function encodeClientWebSocketTextFramePayload(opcodeOrPayload, maybePayload) {
+  const opcode = Buffer.isBuffer(opcodeOrPayload) ? 0x1 : opcodeOrPayload;
+  const payload = Buffer.isBuffer(opcodeOrPayload) ? opcodeOrPayload : maybePayload;
+  const lenBytes =
+    payload.length < 126
+      ? Buffer.from([0x80 | opcode, 0x80 | payload.length])
+      : payload.length <= 0xffff
+        ? Buffer.from([0x80 | opcode, 0x80 | 126, payload.length >> 8, payload.length & 0xff])
+        : Buffer.concat([
+            Buffer.from([0x80 | opcode, 0x80 | 127]),
+            Buffer.from([
+              0,
+              0,
+              0,
+              0,
+              (payload.length / 2 ** 24) & 0xff,
+              (payload.length / 2 ** 16) & 0xff,
+              (payload.length / 2 ** 8) & 0xff,
+              payload.length & 0xff,
+            ]),
+          ]);
+  const mask = randomBytes(4);
+  const masked = Buffer.alloc(payload.length);
+  for (let i = 0; i < payload.length; i += 1) {
+    masked[i] = payload[i] ^ mask[i % 4];
+  }
+  return Buffer.concat([lenBytes, mask, masked]);
+}
+
+function decodeWebSocketFrame(buffer) {
+  if (buffer.length < 2) {
+    return null;
+  }
+  const opcode = buffer[0] & 0x0f;
+  const masked = (buffer[1] & 0x80) !== 0;
+  let length = buffer[1] & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < offset + 2) {
+      return null;
+    }
+    length = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (length === 127) {
+    if (buffer.length < offset + 8) {
+      return null;
+    }
+    const high = buffer.readUInt32BE(offset);
+    const low = buffer.readUInt32BE(offset + 4);
+    length = high * 2 ** 32 + low;
+    offset += 8;
+  }
+  const maskLength = masked ? 4 : 0;
+  if (buffer.length < offset + maskLength + length) {
+    return null;
+  }
+  const mask = masked ? buffer.slice(offset, offset + 4) : null;
+  offset += maskLength;
+  const payload = Buffer.from(buffer.slice(offset, offset + length));
+  if (mask) {
+    for (let i = 0; i < payload.length; i += 1) {
+      payload[i] ^= mask[i % 4];
+    }
+  }
+  return { opcode, payload, bytes: offset + length };
+}
+
+function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function codexArgsWithRemote(args, endpoint) {
+  const next = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--remote") {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--remote=")) {
+      continue;
+    }
+    next.push(arg);
+  }
+  next.push("--remote", endpoint);
+  return next;
+}
+
+function readFlagValue(values, name) {
+  const prefix = `${name}=`;
+  for (const value of values) {
+    if (value.startsWith(prefix)) {
+      return value.slice(prefix.length);
+    }
+  }
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
