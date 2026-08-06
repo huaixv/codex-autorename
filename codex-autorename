@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import net from "node:net";
@@ -34,60 +34,74 @@ const ASSIST_PROMPT_PREFIX =
   "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.";
 
 const args = process.argv.slice(2);
+const selfTest = args.includes("--self-test");
 const realCodex =
   readFlagValue(args, "--real-codex") || process.env.CODEX_REAL_BIN || DEFAULT_REAL_CODEX;
-const codexArgs = args.filter((arg) => !arg.startsWith("--real-codex="));
+const codexArgs = args.filter(
+  (arg) => arg !== "--self-test" && !arg.startsWith("--real-codex="),
+);
 
-const runtimeDir = mkdtempSync(join(tmpdir(), "codex-auto-title-proxy-"));
-const backendSocket = join(runtimeDir, "backend.sock");
-const proxySocket = join(runtimeDir, "proxy.sock");
-const backendEndpoint = `unix://${backendSocket}`;
-const proxyEndpoint = `unix://${proxySocket}`;
-
-let backend = null;
-let proxyServer = null;
-let tui = null;
-
-try {
-  backend = spawn(realCodex, ["app-server", "--listen", backendEndpoint], {
-    stdio: ["ignore", "ignore", "pipe"],
-    env: process.env,
-  });
-  let backendStderr = "";
-  backend.stderr.on("data", (chunk) => {
-    backendStderr += chunk.toString("utf8");
-  });
-  await waitForSocket(backendSocket, backend, () => backendStderr);
-
-  proxyServer = await startProxy(proxySocket, backendSocket);
-
-  tui = spawn(realCodex, [...codexArgsWithRemote(codexArgs, proxyEndpoint)], {
-    stdio: "inherit",
-    env: process.env,
-  });
-
-  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-    process.on(signal, () => {
-      tui?.kill(signal);
-      backend?.kill(signal);
-    });
-  }
-
-  const exit = await new Promise((resolve) => {
-    tui.on("exit", (code, signal) => resolve({ code, signal }));
-  });
-  if (exit.signal) {
-    process.exitCode = 128;
-  } else {
-    process.exitCode = exit.code ?? 0;
-  }
-} finally {
-  proxyServer?.close();
-  backend?.kill("SIGTERM");
-  rmSync(runtimeDir, { recursive: true, force: true });
+if (selfTest) {
+  runSelfTest();
+} else {
+  await runProxy();
 }
 
-async function startProxy(proxySocketPath, backendSocketPath) {
+async function runProxy() {
+  const runtimeDir = mkdtempSync(join(tmpdir(), "codex-auto-title-proxy-"));
+  const backendSocket = join(runtimeDir, "backend.sock");
+  const proxySocket = join(runtimeDir, "proxy.sock");
+  const backendEndpoint = `unix://${backendSocket}`;
+  const proxyEndpoint = `unix://${proxySocket}`;
+
+  let backend = null;
+  let proxyServer = null;
+  let tui = null;
+
+  try {
+    backend = spawn(realCodex, ["app-server", "--listen", backendEndpoint], {
+      stdio: ["ignore", "ignore", "pipe"],
+      env: process.env,
+    });
+    let backendStderr = "";
+    backend.stderr.on("data", (chunk) => {
+      backendStderr += chunk.toString("utf8");
+    });
+    await waitForSocket(backendSocket, backend, () => backendStderr);
+
+    const launchCwd = effectiveCwd(codexArgs);
+    proxyServer = await startProxy(proxySocket, backendSocket, {
+      implicitPickerCwd: codexArgs.includes("--all") ? null : launchCwd,
+    });
+
+    tui = spawn(realCodex, codexArgsWithRemote(codexArgs, proxyEndpoint, launchCwd), {
+      stdio: "inherit",
+      env: process.env,
+    });
+
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+      process.on(signal, () => {
+        tui?.kill(signal);
+        backend?.kill(signal);
+      });
+    }
+
+    const exit = await new Promise((resolve) => {
+      tui.on("exit", (code, signal) => resolve({ code, signal }));
+    });
+    if (exit.signal) {
+      process.exitCode = 128;
+    } else {
+      process.exitCode = exit.code ?? 0;
+    }
+  } finally {
+    proxyServer?.close();
+    backend?.kill("SIGTERM");
+    rmSync(runtimeDir, { recursive: true, force: true });
+  }
+}
+
+async function startProxy(proxySocketPath, backendSocketPath, options = {}) {
   mkdirSync(dirname(proxySocketPath), { recursive: true });
   const server = net.createServer((client) => {
     const backendConn = net.createConnection(backendSocketPath);
@@ -97,11 +111,19 @@ async function startProxy(proxySocketPath, backendSocketPath) {
       backendBuffer: Buffer.alloc(0),
       clientUpgraded: false,
       backendUpgraded: false,
+      sawApplicationRequest: false,
+      forcePickerCwd: false,
     };
 
     client.on("data", (chunk) => {
       state.clientBuffer = Buffer.concat([state.clientBuffer, chunk]);
-      pumpClientToBackend(state, client, backendConn, backendSocketPath);
+      pumpClientToBackend(
+        state,
+        client,
+        backendConn,
+        backendSocketPath,
+        options.implicitPickerCwd,
+      );
     });
     backendConn.on("data", (chunk) => {
       state.backendBuffer = Buffer.concat([state.backendBuffer, chunk]);
@@ -124,7 +146,7 @@ async function startProxy(proxySocketPath, backendSocketPath) {
   return server;
 }
 
-function pumpClientToBackend(state, client, backendConn, backendSocketPath) {
+function pumpClientToBackend(state, client, backendConn, backendSocketPath, implicitPickerCwd) {
   if (!state.clientUpgraded) {
     const headerEnd = state.clientBuffer.indexOf("\r\n\r\n");
     if (headerEnd === -1) {
@@ -142,17 +164,42 @@ function pumpClientToBackend(state, client, backendConn, backendSocketPath) {
       break;
     }
     state.clientBuffer = state.clientBuffer.slice(frame.bytes);
-    backendConn.write(encodeClientWebSocketTextFramePayload(frame.opcode, frame.payload));
     if (frame.opcode !== 0x1) {
+      backendConn.write(encodeClientWebSocketTextFramePayload(frame.opcode, frame.payload));
       continue;
     }
-    const message = parseJson(frame.payload.toString("utf8"));
+    let message = parseJson(frame.payload.toString("utf8"));
+    message = addImplicitPickerCwd(message, state, implicitPickerCwd);
+    const payload = message ? Buffer.from(JSON.stringify(message), "utf8") : frame.payload;
+    backendConn.write(encodeClientWebSocketTextFramePayload(frame.opcode, payload));
     const turn = firstTurnStart(message, state.renamedThreads);
     if (turn) {
       state.renamedThreads.add(turn.threadId);
       setImmediate(() => renameFromInitialPrompt(backendSocketPath, turn.threadId, turn.prompt));
     }
   }
+}
+
+function addImplicitPickerCwd(message, state, cwd) {
+  if (!message || typeof message.method !== "string") {
+    return message;
+  }
+
+  const isApplicationRequest = message.id !== undefined && message.method !== "initialize";
+  if (isApplicationRequest && !state.sawApplicationRequest) {
+    state.sawApplicationRequest = true;
+    // The in-session /resume picker opens a new remote connection but loses the
+    // launch-time --cd override. Its first request is an unfiltered thread/list.
+    state.forcePickerCwd = message.method === "thread/list" && !message.params?.cwd && Boolean(cwd);
+  }
+
+  if (state.forcePickerCwd && message.method === "thread/list" && !message.params?.cwd) {
+    return {
+      ...message,
+      params: { ...(message.params ?? {}), cwd },
+    };
+  }
+  return message;
 }
 
 function pumpBackendToClient(state, client, backendConn) {
@@ -565,7 +612,7 @@ function parseJson(text) {
   }
 }
 
-function codexArgsWithRemote(args, endpoint) {
+function codexArgsWithRemote(args, endpoint, cwd = process.cwd()) {
   const next = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -578,8 +625,36 @@ function codexArgsWithRemote(args, endpoint) {
     }
     next.push(arg);
   }
+  // `--remote` makes the TUI treat the managed local app-server as a remote
+  // workspace. Codex only enables the resume picker's cwd filter for a remote
+  // workspace when it receives an explicit --cd value.
+  if (!hasCwdOverride(next)) {
+    next.push("--cd", cwd);
+  }
   next.push("--remote", endpoint);
   return next;
+}
+
+function hasCwdOverride(args) {
+  return args.some(
+    (arg) => arg === "-C" || arg === "--cd" || arg.startsWith("--cd=") || /^-C.+/.test(arg),
+  );
+}
+
+function effectiveCwd(args, baseCwd = process.cwd()) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "-C" || arg === "--cd") {
+      return resolve(baseCwd, args[i + 1] ?? baseCwd);
+    }
+    if (arg.startsWith("--cd=")) {
+      return resolve(baseCwd, arg.slice("--cd=".length));
+    }
+    if (/^-C.+/.test(arg)) {
+      return resolve(baseCwd, arg.slice(2));
+    }
+  }
+  return baseCwd;
 }
 
 function readFlagValue(values, name) {
@@ -594,4 +669,69 @@ function readFlagValue(values, name) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runSelfTest() {
+  const endpoint = "unix:///tmp/proxy.sock";
+  const cwd = "/workspace/current";
+  const cases = [
+    {
+      input: [],
+      expected: ["--cd", cwd, "--remote", endpoint],
+    },
+    {
+      input: ["--remote", "unix:///old.sock", "--model", "gpt-test"],
+      expected: ["--model", "gpt-test", "--cd", cwd, "--remote", endpoint],
+    },
+    {
+      input: ["--cd", "/workspace/explicit"],
+      expected: ["--cd", "/workspace/explicit", "--remote", endpoint],
+    },
+    {
+      input: ["-C/workspace/explicit"],
+      expected: ["-C/workspace/explicit", "--remote", endpoint],
+    },
+  ];
+
+  for (const { input, expected } of cases) {
+    const actual = codexArgsWithRemote(input, endpoint, cwd);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      console.error(
+        `codexArgsWithRemote failed: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  if (effectiveCwd(["--cd", "nested"], cwd) !== "/workspace/current/nested") {
+    console.error("effectiveCwd failed");
+    process.exitCode = 1;
+    return;
+  }
+
+  const pickerState = { sawApplicationRequest: false, forcePickerCwd: false };
+  const pickerList = addImplicitPickerCwd(
+    { id: 2, method: "thread/list", params: { limit: 25 } },
+    pickerState,
+    cwd,
+  );
+  if (pickerList.params.cwd !== cwd || !pickerState.forcePickerCwd) {
+    console.error("addImplicitPickerCwd failed to scope the in-session picker");
+    process.exitCode = 1;
+    return;
+  }
+  const mainState = { sawApplicationRequest: false, forcePickerCwd: false };
+  addImplicitPickerCwd({ id: 2, method: "account/read", params: {} }, mainState, cwd);
+  const mainList = addImplicitPickerCwd(
+    { id: 3, method: "thread/list", params: { limit: 25 } },
+    mainState,
+    cwd,
+  );
+  if (mainList.params.cwd !== undefined || mainState.forcePickerCwd) {
+    console.error("addImplicitPickerCwd incorrectly scoped a regular connection");
+    process.exitCode = 1;
+    return;
+  }
+  console.log("self-test passed");
 }
