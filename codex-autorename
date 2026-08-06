@@ -13,7 +13,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import net from "node:net";
 
-const DEFAULT_REAL_CODEX = "/usr/bin/codex";
+const DEFAULT_REAL_CODEX = "codex";
 const ASSIST_MODEL = "gpt-5.4-mini";
 const TITLE_MAX_CHARS = 36;
 const PROMPT_MAX_CHARS = 2000;
@@ -22,7 +22,8 @@ const ASSIST_PROMPT_PREFIX =
   "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.";
 
 const args = process.argv.slice(2);
-const realCodex = readFlagValue(args, "--real-codex") || DEFAULT_REAL_CODEX;
+const realCodex =
+  readFlagValue(args, "--real-codex") || process.env.CODEX_REAL_BIN || DEFAULT_REAL_CODEX;
 const codexArgs = args.filter((arg) => !arg.startsWith("--real-codex="));
 
 const runtimeDir = mkdtempSync(join(tmpdir(), "codex-auto-title-proxy-"));

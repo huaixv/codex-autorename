@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const DEFAULT_REAL_CODEX = "/usr/bin/codex";
+const DEFAULT_REAL_CODEX = "codex";
 const CODEX_HOME = process.env.CODEX_HOME || join(process.env.HOME || "", ".codex");
 const HISTORY_PATH = join(CODEX_HOME, "history.jsonl");
 const SESSION_INDEX_PATH = join(CODEX_HOME, "session_index.jsonl");
@@ -25,7 +25,8 @@ const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
 const selfTest = args.includes("--self-test");
 const limit = parsePositiveInteger(readFlagValue(args, "--limit") || readFlagValue(args, "--batch-limit"));
-const realCodex = readFlagValue(args, "--real-codex") || DEFAULT_REAL_CODEX;
+const realCodex =
+  readFlagValue(args, "--real-codex") || process.env.CODEX_REAL_BIN || DEFAULT_REAL_CODEX;
 
 if (selfTest) {
   runSelfTest();
@@ -278,7 +279,7 @@ function parsePositiveInteger(value) {
 }
 
 function realCodexBin() {
-  return process.env.CODEX_REAL_BIN || realCodex;
+  return realCodex;
 }
 
 function runSelfTest() {
