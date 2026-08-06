@@ -10,8 +10,8 @@ depends=('nodejs')
 optdepends=('openai-codex: real Codex CLI resolved from PATH')
 source=("codex-autorename"
         "codex-batch-rename")
-sha256sums=('b3f5f584aa657669992764a64cb00b9c2c022f22c7dc57eb1e53356112b23b2f'
-            'a3513b65954f2db41f58cd3ced0e8062e376394ff76d7e14d87e0563b77c4a1e')
+sha256sums=('0d0064409c3a75e68e675d196818411ee53d128a16ec379f259f2c63ff169739'
+            'e0a72cfaacad08652b21654b0f286cb8c3aac97a61894cb5e164376b30df60e4')
 
 package() {
   install -Dm755 "${srcdir}/codex-autorename" "${pkgdir}/usr/bin/codex-autorename"

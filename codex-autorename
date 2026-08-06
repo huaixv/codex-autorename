@@ -14,7 +14,7 @@ import { randomBytes } from "node:crypto";
 import net from "node:net";
 
 const DEFAULT_REAL_CODEX = "codex";
-const ASSIST_MODEL = "gpt-5.4-mini";
+const ASSIST_MODEL = "gpt-5.6-luna";
 const TITLE_MAX_CHARS = 36;
 const PROMPT_MAX_CHARS = 2000;
 const STARTUP_TIMEOUT_MS = 15000;
